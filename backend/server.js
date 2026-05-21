@@ -17,6 +17,7 @@ app.use(cors({
             /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin) ||
             /^https?:\/\/(192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)/.test(origin) ||
             /\.netlify\.app$/.test(origin) ||
+            /\.vercel\.app$/.test(origin) ||
             /\.github\.io$/.test(origin)
         );
 
