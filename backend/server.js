@@ -10,8 +10,8 @@ app.use(express.urlencoded({ limit: '50mb', extended: true }));
 // CORS: allow any localhost port (dev), LAN IPs, Netlify, GitHub Pages, and file:// (null)
 app.use(cors({
     origin: function (origin, callback) {
-        // null origin = file:// protocol — always allow
-        if (!origin) return callback(null, true);
+        // null origin = file:// protocol (can be undefined or the literal string "null")
+        if (!origin || origin === 'null') return callback(null, true);
 
         const allowed = (
             /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin) ||
