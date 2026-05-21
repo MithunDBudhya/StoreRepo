@@ -150,6 +150,13 @@ const DailyReportSchema = new mongoose.Schema({
 });
 const DailyReport = mongoose.model('DailyReport', DailyReportSchema);
 
+const NotifyRequestSchema = new mongoose.Schema({
+    userId: String,
+    productId: Number,
+    date: { type: Date, default: Date.now }
+});
+const NotifyRequest = mongoose.model('NotifyRequest', NotifyRequestSchema);
+
 // FIX #3: Centralize the redeem discount constant (was hardcoded as 30 in two places)
 const REDEEM_DISCOUNT_AMOUNT = 30;
 
@@ -169,6 +176,19 @@ const fallbackProducts = [
     { id: 12, name: "Fluid Mechanics Manual + Eval", price: 140, category: "Combo", branch: "MECH", semester: "4", stock: 40, img: "🛠️" }
 ];
 
+// Local In-Memory Database Fallbacks (for when MongoDB is offline)
+let localUsers = [
+    { name: "Admin Manager", email: "admin@college.edu", usn: "admin", pwd: "admin", role: "admin", points: 0, referralCode: "ADMIN", refUsed: null }
+];
+let localOrders = [];
+let localNotifications = [];
+let localPrintRequests = [];
+let localProducts = JSON.parse(JSON.stringify(fallbackProducts));
+let localSaleAnalytics = [];
+let localRedeemTransactions = [];
+let localDailyReports = [];
+let localNotifyRequests = [];
+
 async function seedProducts() {
     if (mongoose.connection.readyState !== 1) return;
     try {
@@ -181,10 +201,44 @@ async function seedProducts() {
 }
 seedProducts();
 
+// Helper function to handle Notifications for Restocked Items
+async function handleRestockNotifications(productId, productName) {
+    let matches = [];
+    if (mongoose.connection.readyState !== 1) {
+        matches = localNotifyRequests.filter(r => r.productId === productId);
+        localNotifyRequests = localNotifyRequests.filter(r => r.productId !== productId);
+    } else {
+        matches = await NotifyRequest.find({ productId });
+        await NotifyRequest.deleteMany({ productId });
+    }
+
+    for (const req of matches) {
+        const title = "Item Back In Stock!";
+        const desc = `${productName} is available now.`;
+        const alertStr = JSON.stringify({ id: productId, name: productName });
+        const notifObj = {
+            id: (Date.now() + Math.random()).toString(),
+            userId: req.userId,
+            title,
+            desc,
+            unread: true,
+            timestamp: new Date().toLocaleTimeString(),
+            alertStr
+        };
+
+        if (mongoose.connection.readyState !== 1) {
+            localNotifications.push(notifObj);
+        } else {
+            const newNotif = new Notification(notifObj);
+            await newNotif.save();
+        }
+    }
+}
+
 app.get('/api/products', async (req, res) => {
     if (mongoose.connection.readyState !== 1) {
         console.warn("⚠️ Serving Catalog from Backup (Local Sync Mode)");
-        return res.json(fallbackProducts);
+        return res.json(localProducts);
     }
     try {
         let prodList = await Product.find({}).sort({ id: 1 }).maxTimeMS(2000);
@@ -194,7 +248,7 @@ app.get('/api/products', async (req, res) => {
         }
         res.json(prodList);
     } catch (err) {
-        res.json(fallbackProducts);
+        res.json(localProducts);
     }
 });
 
@@ -205,8 +259,21 @@ app.post('/api/products/restock', async (req, res) => {
         if (!id || typeof amount !== 'number' || amount <= 0) {
             return res.status(400).json({ error: "Invalid restock parameters." });
         }
-        const prod = await Product.findOneAndUpdate({ id }, { $inc: { stock: amount } }, { new: true });
-        if (!prod) return res.status(404).json({ error: "Product not found." });
+
+        let prod;
+        if (mongoose.connection.readyState !== 1) {
+            const match = localProducts.find(p => p.id === id);
+            if (!match) return res.status(404).json({ error: "Product not found." });
+            match.stock += amount;
+            prod = match;
+        } else {
+            prod = await Product.findOneAndUpdate({ id }, { $inc: { stock: amount } }, { new: true });
+            if (!prod) return res.status(404).json({ error: "Product not found." });
+        }
+
+        // Trigger restock alerts
+        await handleRestockNotifications(id, prod.name);
+
         res.json({ success: true, product: prod });
     } catch (err) { res.status(500).json({ error: "Restock failed" }); }
 });
@@ -238,16 +305,27 @@ async function trackSale(item, orderDate) {
 // --- Automated Daily Reports @ 7:00 PM ---
 async function generateDailyReport() {
     const today = new Date().toLocaleDateString();
-    const orders = await Order.find({ date: { $regex: today.split(',')[0] } });
+    
+    let orders, soldList, stockList, redemptions;
+
+    if (mongoose.connection.readyState !== 1) {
+        orders = localOrders.filter(o => o.date && o.date.split(',')[0].trim() === today.split(',')[0].trim());
+        soldList = localSaleAnalytics.filter(s => new Date(s.date).toDateString() === new Date().toDateString());
+        stockList = localProducts.map(p => ({ name: p.name, stock: p.stock }));
+        redemptions = localRedeemTransactions.filter(r => new Date(r.date).toDateString() === new Date().toDateString());
+    } else {
+        orders = await Order.find({ date: { $regex: today.split(',')[0] } });
+        soldList = await SaleAnalytics.find({ date: { $gte: new Date().setHours(0,0,0,0) } });
+        stockList = await Product.find({}, 'name stock');
+        redemptions = await RedeemTransaction.find({ date: { $gte: new Date().setHours(0,0,0,0) } });
+    }
+
     const totalSales = orders.reduce((sum, o) => sum + (o.status === 'Cancelled' ? 0 : o.total), 0);
     const totalOrders = orders.length;
     const cancelledCount = orders.filter(o => o.status === 'Cancelled').length;
-    const soldList = await SaleAnalytics.find({ date: { $gte: new Date().setHours(0,0,0,0) } });
-    const stockList = await Product.find({}, 'name stock');
-    const redemptions = await RedeemTransaction.find({ date: { $gte: new Date().setHours(0,0,0,0) } });
     const totalRedeems = redemptions.reduce((sum, r) => sum + r.discountAmount, 0);
 
-    const report = new DailyReport({
+    const reportData = {
         date: today,
         totalRevenue: totalSales,
         totalOrders,
@@ -255,21 +333,32 @@ async function generateDailyReport() {
         remainingStock: stockList,
         redeemDiscounts: totalRedeems,
         cancelledOrders: cancelledCount
-    });
+    };
 
-    await report.save();
-    console.log(`📊 Daily Report for ${today} generated successfully.`);
-    return report;
+    if (mongoose.connection.readyState !== 1) {
+        localDailyReports.push(reportData);
+        console.log(`📊 Local Daily Report for ${today} generated successfully.`);
+        return reportData;
+    } else {
+        const report = new DailyReport(reportData);
+        await report.save();
+        console.log(`📊 Daily Report for ${today} generated successfully.`);
+        return report;
+    }
 }
 
 cron.schedule('0 19 * * *', () => {
-    generateDailyReport();
+    generateDailyReport().catch(err => console.error("Cron report error:", err.message));
 });
 
 // --- API Implementation ---
 
 app.get('/api/admin/analytics', async (req, res) => {
     try {
+        if (mongoose.connection.readyState !== 1) {
+            const totalSales = localSaleAnalytics.reduce((s, i) => s + i.revenue, 0);
+            return res.json({ sold: localSaleAnalytics, redeems: localRedeemTransactions, totalSales });
+        }
         const sold = await SaleAnalytics.find({});
         const redeems = await RedeemTransaction.find({});
         const totalSales = sold.reduce((s, i) => s + i.revenue, 0);
@@ -289,29 +378,90 @@ app.post('/api/orders', async (req, res) => {
         const originalTotal = orderData.items.reduce((sum, item) => sum + (item.price * item.qty), 0);
         orderData.originalTotal = originalTotal;
 
-        const newOrder = new Order(orderData);
-        await newOrder.save();
+        // Authoritative reward points calculation on backend
+        const pointsEarned = Math.floor(orderData.total * 0.05);
+        orderData.points = pointsEarned;
 
-        for (const item of orderData.items) {
-            // Skip bundles and print items — they don't have real stock to track
-            if (!item.isBundle && !item.isPrint) {
-                await trackSale(item, orderData.date);
+        if (mongoose.connection.readyState !== 1) {
+            localOrders.push(orderData);
+
+            for (const item of orderData.items) {
+                if (!item.isBundle && !item.isPrint) {
+                    const prod = localProducts.find(p => p.id === item.id);
+                    if (prod) prod.stock = Math.max(0, prod.stock - item.qty);
+
+                    // Track sale locally
+                    const todayStr = new Date().toDateString();
+                    let sale = localSaleAnalytics.find(s => s.productId === item.id && new Date(s.date).toDateString() === todayStr);
+                    if (sale) {
+                        sale.quantitySold += item.qty;
+                        sale.revenue += item.price * item.qty;
+                    } else {
+                        localSaleAnalytics.push({
+                            productId: item.id,
+                            productName: item.name,
+                            quantitySold: item.qty,
+                            revenue: item.price * item.qty,
+                            date: new Date()
+                        });
+                    }
+                }
+            }
+
+            // Update user points locally
+            const user = localUsers.find(u => u.email === orderData.userId);
+            if (user) {
+                if (orderData.redeemedPoints) {
+                    user.points = Math.max(0, user.points - 300);
+                }
+                user.points += pointsEarned;
+            }
+
+            if (orderData.redeemedPoints) {
+                localRedeemTransactions.push({
+                    orderId: orderData.id,
+                    userId: orderData.userId,
+                    userName: orderData.userName,
+                    productNames: orderData.items.map(i => i.name),
+                    discountAmount: REDEEM_DISCOUNT_AMOUNT,
+                    finalPrice: orderData.total,
+                    date: new Date()
+                });
+            }
+        } else {
+            const newOrder = new Order(orderData);
+            await newOrder.save();
+
+            for (const item of orderData.items) {
+                if (!item.isBundle && !item.isPrint) {
+                    await trackSale(item, orderData.date);
+                }
+            }
+
+            // Sync reward points to user database securely
+            const user = await User.findOne({ email: orderData.userId });
+            if (user) {
+                if (orderData.redeemedPoints) {
+                    user.points = Math.max(0, user.points - 300);
+                }
+                user.points += pointsEarned;
+                await user.save();
+            }
+
+            if (orderData.redeemedPoints) {
+                const rt = new RedeemTransaction({
+                    orderId: orderData.id,
+                    userId: orderData.userId,
+                    userName: orderData.userName,
+                    productNames: orderData.items.map(i => i.name),
+                    discountAmount: REDEEM_DISCOUNT_AMOUNT,
+                    finalPrice: orderData.total
+                });
+                await rt.save();
             }
         }
 
-        if (orderData.redeemedPoints) {
-            const rt = new RedeemTransaction({
-                orderId: orderData.id,
-                userId: orderData.userId,
-                userName: orderData.userName,
-                productNames: orderData.items.map(i => i.name),
-                discountAmount: REDEEM_DISCOUNT_AMOUNT, // FIX #3: use constant
-                finalPrice: orderData.total
-            });
-            await rt.save();
-        }
-
-        res.json({ success: true, order: newOrder });
+        res.json({ success: true, order: orderData });
     } catch (err) {
         console.error(err);
         res.status(500).json({ error: "Order failed" });
@@ -325,22 +475,49 @@ app.put('/api/orders/:id', async (req, res) => {
             req.body.completionDate = new Date().toISOString();
         }
 
-        const existing = await Order.findOne({ id: req.params.id });
+        let existing;
+        if (mongoose.connection.readyState !== 1) {
+            existing = localOrders.find(o => o.id === req.params.id);
+            if (!existing) {
+                return res.status(404).json({ error: "Order not found." });
+            }
 
-        // FIX #6: Null-guard — if order not found, return 404 instead of crashing
-        if (!existing) {
-            return res.status(404).json({ error: "Order not found." });
-        }
-
-        if (status === 'Cancelled' && existing.status !== 'Cancelled') {
-            for (const item of existing.items) {
-                // Only restore stock for real product items, not bundles or prints
-                if (!item.isBundle && !item.isPrint) {
-                    await Product.findOneAndUpdate({ id: item.id }, { $inc: { stock: item.qty } });
+            if (status === 'Cancelled' && existing.status !== 'Cancelled') {
+                for (const item of existing.items) {
+                    if (!item.isBundle && !item.isPrint) {
+                        const prod = localProducts.find(p => p.id === item.id);
+                        if (prod) prod.stock += item.qty;
+                    }
+                }
+                const user = localUsers.find(u => u.email === existing.userId);
+                if (user) {
+                    user.points = Math.max(0, user.points - (existing.points || 0));
                 }
             }
+            Object.assign(existing, req.body);
+        } else {
+            existing = await Order.findOne({ id: req.params.id });
+
+            // FIX #6: Null-guard — if order not found, return 404 instead of crashing
+            if (!existing) {
+                return res.status(404).json({ error: "Order not found." });
+            }
+
+            if (status === 'Cancelled' && existing.status !== 'Cancelled') {
+                for (const item of existing.items) {
+                    // Only restore stock for real product items, not bundles or prints
+                    if (!item.isBundle && !item.isPrint) {
+                        await Product.findOneAndUpdate({ id: item.id }, { $inc: { stock: item.qty } });
+                    }
+                }
+                const user = await User.findOne({ email: existing.userId });
+                if (user) {
+                    user.points = Math.max(0, user.points - (existing.points || 0));
+                    await user.save();
+                }
+            }
+            await Order.findOneAndUpdate({ id: req.params.id }, req.body);
         }
-        await Order.findOneAndUpdate({ id: req.params.id }, req.body);
         res.json({ success: true });
     } catch (err) {
         console.error("Order update error:", err);
@@ -350,6 +527,9 @@ app.put('/api/orders/:id', async (req, res) => {
 
 app.get('/api/orders', async (req, res) => {
     try {
+        if (mongoose.connection.readyState !== 1) {
+            return res.json(localOrders);
+        }
         const orders = await Order.find({});
         res.json(orders);
     } catch (err) { res.status(500).json({ error: "Fetch orders failed" }); }
@@ -357,6 +537,14 @@ app.get('/api/orders', async (req, res) => {
 
 app.get('/api/users', async (req, res) => {
     try {
+        if (mongoose.connection.readyState !== 1) {
+            const safeUsers = localUsers.map(u => {
+                const copy = { ...u };
+                delete copy.pwd;
+                return copy;
+            });
+            return res.json(safeUsers);
+        }
         const users = await User.find({}, '-pwd');
         res.json(users);
     } catch (err) { res.status(500).json({ error: "Failed to fetch users" }); }
@@ -366,8 +554,15 @@ app.delete('/api/users/:email', async (req, res) => {
     try {
         const { email } = req.params;
         if (email === 'admin@college.edu') return res.status(403).json({ error: "Cannot delete admin!" });
-        await User.findOneAndDelete({ email });
-        res.json({ success: true, message: "User deleted successfully" });
+
+        if (mongoose.connection.readyState !== 1) {
+            const index = localUsers.findIndex(u => u.email === email);
+            if (index !== -1) localUsers.splice(index, 1);
+            return res.json({ success: true, message: "User deleted successfully" });
+        } else {
+            await User.findOneAndDelete({ email });
+            res.json({ success: true, message: "User deleted successfully" });
+        }
     } catch (err) { res.status(500).json({ error: "Failed to delete user" }); }
 });
 
@@ -378,8 +573,14 @@ app.post('/api/update-points', async (req, res) => {
         if (!email || typeof points !== 'number' || points < 0 || isNaN(points)) {
             return res.status(400).json({ error: "Invalid points value." });
         }
-        await User.findOneAndUpdate({ email }, { points: points });
-        res.json({ success: true });
+        if (mongoose.connection.readyState !== 1) {
+            const user = localUsers.find(u => u.email === email);
+            if (user) user.points = points;
+            return res.json({ success: true });
+        } else {
+            await User.findOneAndUpdate({ email }, { points: points });
+            res.json({ success: true });
+        }
     } catch (err) { res.status(500).json({ error: "Failed to sync points" }); }
 });
 
@@ -387,6 +588,12 @@ app.post('/api/update-points', async (req, res) => {
 app.get('/api/notifications', async (req, res) => {
     try {
         const { userId } = req.query;
+        if (mongoose.connection.readyState !== 1) {
+            const notifs = userId 
+                ? localNotifications.filter(n => n.userId === userId || n.userId === 'all')
+                : localNotifications;
+            return res.json(notifs.slice().reverse().slice(0, 200));
+        }
         const query = userId ? { $or: [{ userId }, { userId: 'all' }] } : {};
         const notifs = await Notification.find(query).sort({ _id: -1 }).limit(200);
         res.json(notifs);
@@ -395,21 +602,35 @@ app.get('/api/notifications', async (req, res) => {
 
 app.post('/api/notifications', async (req, res) => {
     try {
-        const newNotif = new Notification(req.body);
-        await newNotif.save();
-        res.json({ success: true, notification: newNotif });
+        if (mongoose.connection.readyState !== 1) {
+            localNotifications.push(req.body);
+            return res.json({ success: true, notification: req.body });
+        } else {
+            const newNotif = new Notification(req.body);
+            await newNotif.save();
+            res.json({ success: true, notification: newNotif });
+        }
     } catch (err) { res.status(500).json({ error: "Create notif failed" }); }
 });
 
 app.put('/api/notifications/:id', async (req, res) => {
     try {
-        await Notification.findOneAndUpdate({ id: req.params.id }, req.body);
-        res.json({ success: true });
+        if (mongoose.connection.readyState !== 1) {
+            const notif = localNotifications.find(n => n.id === req.params.id);
+            if (notif) Object.assign(notif, req.body);
+            return res.json({ success: true });
+        } else {
+            await Notification.findOneAndUpdate({ id: req.params.id }, req.body);
+            res.json({ success: true });
+        }
     } catch (err) { res.status(500).json({ error: "Update notif failed" }); }
 });
 
 app.get('/api/prints', async (req, res) => {
     try {
+        if (mongoose.connection.readyState !== 1) {
+            return res.json(localPrintRequests.slice().reverse().slice(0, 100));
+        }
         const prints = await PrintRequest.find({}).sort({ _id: -1 }).limit(100);
         res.json(prints);
     } catch (err) { res.status(500).json({ error: "Fetch prints failed" }); }
@@ -417,17 +638,63 @@ app.get('/api/prints', async (req, res) => {
 
 app.post('/api/prints', async (req, res) => {
     try {
-        const newPrint = new PrintRequest(req.body);
-        await newPrint.save();
-        res.json({ success: true, print: newPrint });
+        if (mongoose.connection.readyState !== 1) {
+            localPrintRequests.push(req.body);
+            return res.json({ success: true, print: req.body });
+        } else {
+            const newPrint = new PrintRequest(req.body);
+            await newPrint.save();
+            res.json({ success: true, print: newPrint });
+        }
     } catch (err) { res.status(500).json({ error: "Create print failed" }); }
 });
 
 app.put('/api/prints/:id', async (req, res) => {
     try {
-        await PrintRequest.findOneAndUpdate({ id: req.params.id }, req.body);
-        res.json({ success: true });
+        if (mongoose.connection.readyState !== 1) {
+            const print = localPrintRequests.find(pr => pr.id === req.params.id);
+            if (print) Object.assign(print, req.body);
+            return res.json({ success: true });
+        } else {
+            await PrintRequest.findOneAndUpdate({ id: req.params.id }, req.body);
+            res.json({ success: true });
+        }
     } catch (err) { res.status(500).json({ error: "Update print failed" }); }
+});
+
+// --- Notify Requests API ---
+app.get('/api/notify-requests', async (req, res) => {
+    try {
+        if (mongoose.connection.readyState !== 1) {
+            return res.json(localNotifyRequests);
+        }
+        const reqs = await NotifyRequest.find({});
+        res.json(reqs);
+    } catch (err) { res.status(500).json({ error: "Fetch notify requests failed" }); }
+});
+
+app.post('/api/notify-requests', async (req, res) => {
+    try {
+        const { userId, productId } = req.body;
+        if (!userId || !productId) {
+            return res.status(400).json({ error: "userId and productId required." });
+        }
+        if (mongoose.connection.readyState !== 1) {
+            const exists = localNotifyRequests.some(r => r.userId === userId && r.productId === productId);
+            if (exists) return res.json({ success: true, message: "Already requested" });
+
+            const newReq = { id: Date.now().toString(), userId, productId, date: new Date() };
+            localNotifyRequests.push(newReq);
+            return res.json({ success: true, request: newReq });
+        } else {
+            const exists = await NotifyRequest.findOne({ userId, productId });
+            if (exists) return res.json({ success: true, message: "Already requested" });
+
+            const newReq = new NotifyRequest({ userId, productId });
+            await newReq.save();
+            return res.json({ success: true, request: newReq });
+        }
+    } catch (err) { res.status(500).json({ error: "Save notify request failed" }); }
 });
 
 // --- Master Audit Reports ---
@@ -437,8 +704,13 @@ app.get('/api/admin/reports/csv', async (req, res) => {
         const d = new Date();
         const today = `${String(d.getDate()).padStart(2, '0')}/${String(d.getMonth() + 1).padStart(2, '0')}/${d.getFullYear()}`;
 
-        const allCompletedOrders = await Order.find({ status: 'Completed' }).select('-items');
-        const allCompletedPrints = await PrintRequest.find({ status: 'Completed' });
+        const allCompletedOrders = mongoose.connection.readyState !== 1
+            ? localOrders.filter(o => o.status === 'Completed')
+            : await Order.find({ status: 'Completed' }).select('-items');
+
+        const allCompletedPrints = mongoose.connection.readyState !== 1
+            ? localPrintRequests.filter(pr => pr.status === 'Completed')
+            : await PrintRequest.find({ status: 'Completed' });
 
         const filePath = path.join(__dirname, `daily_audit_report_${Date.now()}.csv`); // FIX #9: unique filename to avoid race condition
         const csvWriter = createObjectCsvWriter({
@@ -514,8 +786,13 @@ app.get('/api/admin/reports/pdf', async (req, res) => {
         const d = new Date();
         const today = `${String(d.getDate()).padStart(2, '0')}/${String(d.getMonth() + 1).padStart(2, '0')}/${d.getFullYear()}`;
 
-        const allCompletedOrders = await Order.find({ status: 'Completed' }).select('-items');
-        const allCompletedPrints = await PrintRequest.find({ status: 'Completed' });
+        const allCompletedOrders = mongoose.connection.readyState !== 1
+            ? localOrders.filter(o => o.status === 'Completed')
+            : await Order.find({ status: 'Completed' }).select('-items');
+
+        const allCompletedPrints = mongoose.connection.readyState !== 1
+            ? localPrintRequests.filter(pr => pr.status === 'Completed')
+            : await PrintRequest.find({ status: 'Completed' });
 
         const doc = new PDFDocument({ margin: 30 });
         res.setHeader('Content-Type', 'application/pdf');
@@ -613,11 +890,6 @@ app.post('/api/admin/force-report', async (req, res) => {
 });
 
 app.post('/api/signup', async (req, res) => {
-    if (mongoose.connection.readyState !== 1) {
-        console.error("❌ Signup Attempt Failed: Database is not connected.");
-        return res.status(503).json({ error: "Database is connecting/offline. Please try again in 10 seconds." });
-    }
-
     try {
         const { name, email, usn, pwd, refCode } = req.body;
         if (!name || !email || !usn || !pwd) return res.status(400).json({ error: "All fields are required." });
@@ -626,7 +898,12 @@ app.post('/api/signup', async (req, res) => {
         if (pwd.length < 4) return res.status(400).json({ error: "Password must be at least 4 characters." });
         if (pwd.length > 128) return res.status(400).json({ error: "Password too long." });
 
-        const existingUser = await User.findOne({ $or: [{ email }, { usn }] });
+        let existingUser;
+        if (mongoose.connection.readyState !== 1) {
+            existingUser = localUsers.find(u => u.email === email || u.usn === usn);
+        } else {
+            existingUser = await User.findOne({ $or: [{ email }, { usn }] });
+        }
         if (existingUser) return res.status(400).json({ error: "Email or USN already registered." });
 
         const referralCode = name.substring(0, 4).toUpperCase().replace(/\s/g, '') + Math.floor(100+Math.random()*900);
@@ -634,23 +911,43 @@ app.post('/api/signup', async (req, res) => {
         let refUsedByMe = null;
 
         if (refCode) {
-            const referrer = await User.findOne({ referralCode: refCode });
-            if (referrer) {
-                referrer.points += 50;
-                await referrer.save();
-                refUsedByMe = refCode;
-                startingPoints += 25;
+            let referrer;
+            if (mongoose.connection.readyState !== 1) {
+                referrer = localUsers.find(u => u.referralCode === refCode);
+                if (referrer) {
+                    referrer.points += 50;
+                    refUsedByMe = refCode;
+                    startingPoints += 25;
+                }
+            } else {
+                referrer = await User.findOne({ referralCode: refCode });
+                if (referrer) {
+                    referrer.points += 50;
+                    await referrer.save();
+                    refUsedByMe = refCode;
+                    startingPoints += 25;
+                }
             }
         }
 
-        const newUser = new User({
+        const userObj = {
             name, email, usn, pwd, role: "student",
             points: startingPoints, referralCode, refUsed: refUsedByMe
-        });
-        await newUser.save();
-        res.json({ message: "Signup success", user: newUser });
+        };
+
+        if (mongoose.connection.readyState !== 1) {
+            localUsers.push(userObj);
+        } else {
+            const newUser = new User(userObj);
+            await newUser.save();
+        }
+
+        const returnedUser = { ...userObj };
+        delete returnedUser.pwd;
+
+        res.json({ message: "Signup success", user: returnedUser });
     } catch(err) {
-        console.error("🚩 Signup DB Error:", err);
+        console.error("🚩 Signup Error:", err);
         res.status(500).json({ error: "Database Save Error: " + (err.code === 11000 ? "USN or Email already exists in records." : err.message) });
     }
 });
@@ -661,13 +958,23 @@ app.post('/api/login', async (req, res) => {
     if (!loginId || !pwd) return res.status(400).json({ error: "Login credentials required." });
 
     if (loginId === 'admin' || loginId === 'admin@college.edu') {
-        if (pwd === 'admin') return res.json({ user: { name: "Admin", email: "admin@college.edu", role: "admin" } });
+        if (pwd === 'admin') return res.json({ user: { name: "Admin Manager", email: "admin@college.edu", role: "admin", points: 0, referralCode: "ADMIN", refUsed: null } });
         return res.status(400).json({ error: "Invalid credentials." });
     }
-    const user = await User.findOne({ $or: [{ email: loginId }, { usn: loginId }] }).select('+pwd');
-    if (!user || user.pwd !== pwd) return res.status(400).json({ error: "Invalid credentials." });
-    const uObj = user.toObject(); delete uObj.pwd;
-    res.json({ user: uObj });
+
+    let user;
+    if (mongoose.connection.readyState !== 1) {
+        user = localUsers.find(u => (u.email === loginId || u.usn === loginId) && u.pwd === pwd);
+        if (!user) return res.status(400).json({ error: "Invalid credentials." });
+        const returnedUser = { ...user };
+        delete returnedUser.pwd;
+        return res.json({ user: returnedUser });
+    } else {
+        user = await User.findOne({ $or: [{ email: loginId }, { usn: loginId }] }).select('+pwd');
+        if (!user || user.pwd !== pwd) return res.status(400).json({ error: "Invalid credentials." });
+        const uObj = user.toObject(); delete uObj.pwd;
+        res.json({ user: uObj });
+    }
 });
 
 // FIX #14: 404 handler for unknown routes

@@ -104,7 +104,8 @@ document.addEventListener('DOMContentLoaded', () => {
             refreshUsersDatabase(), 
             refreshOrdersDatabase(), 
             refreshNotificationsDatabase(), 
-            refreshPrintsDatabase()
+            refreshPrintsDatabase(),
+            refreshNotifyRequests()
         ]).catch(err => console.error("Initial Sync Issue", err));
         
         // Hide auth if our early inline script didn't catch it for some reason
@@ -137,6 +138,7 @@ document.addEventListener('DOMContentLoaded', () => {
             if (currentUser.role === 'admin') refreshAdminAnalytics(); 
             refreshNotificationsDatabase();
             refreshPrintsDatabase();
+            refreshNotifyRequests();
         }
     }, 5000);
 
@@ -323,6 +325,22 @@ async function refreshPrintsDatabase() {
             if (currentUser && currentUser.role === 'admin') updateAdminDashboard();
         }
     } catch(err) {}
+}
+
+async function refreshNotifyRequests() {
+    try {
+        const response = await fetch(`${API_URL}/api/notify-requests`);
+        if (response.ok) {
+            const fetched = await response.json();
+            if (JSON.stringify(fetched) !== JSON.stringify(notifyRequests)) {
+                notifyRequests = fetched;
+                if (currentUser && currentUser.role === 'student') filterProducts();
+                if (currentUser && currentUser.role === 'admin') updateAdminDashboard();
+            }
+        }
+    } catch(err) {
+        console.error("Notify requests sync failed", err);
+    }
 }
 
 function loginUser(user) {
@@ -1056,14 +1074,30 @@ function updateNotificationsBadge() {
     } else badge.style.display = 'none';
 }
 
-function notifyMe(productId) {
-    const alreadyReq = notifyRequests.some(r => r.userId === currentUser.email && r.productId === productId);
-    if (alreadyReq) { showToast("Request already active.", "info"); return; }
-
-    notifyRequests.push({ userId: currentUser.email, productId: productId });
-    showToast("Request noted! Admin alert enabled.", "success");
-
-    renderCatalog(products);
+async function notifyMe(productId) {
+    if (!currentUser) { showToast("Please log in first.", "error"); return; }
+    try {
+        const response = await fetch(`${API_URL}/api/notify-requests`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ userId: currentUser.email, productId: productId })
+        });
+        const data = await response.json();
+        if (data.success) {
+            const alreadyReq = notifyRequests.some(r => r.userId === currentUser.email && r.productId === productId);
+            if (!alreadyReq) {
+                notifyRequests.push({ userId: currentUser.email, productId: productId });
+            }
+            showToast("Request noted! Admin alert enabled.", "success");
+            filterProducts();
+            if (currentUser.role === 'admin') updateAdminDashboard();
+        } else {
+            showToast(data.error || "Failed to submit request.", "error");
+        }
+    } catch (err) {
+        console.error("Notify request failed:", err);
+        showToast("Backend connection failed!", "error");
+    }
 }
 
 function pushSystemNotification(userId, title, desc, triggerAlertObj = null) {
