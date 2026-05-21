@@ -9,9 +9,11 @@ const isLocal = (
     window.location.hostname.startsWith('172.')
 );
 
-// Empty hostname = opened as file:// — always use production backend
+// By default, connect to the fully-connected production database on Render.com.
+// To use a local backend running on port 5000, add '?local=true' to the URL (e.g., http://localhost:3000/?local=true).
 const PRODUCTION_API = 'https://store-api-backend-cic4.onrender.com';
-const API_URL = isLocal ? 'http://localhost:5000' : PRODUCTION_API;
+const isLocalForced = new URLSearchParams(window.location.search).get('local') === 'true';
+const API_URL = isLocalForced ? 'http://localhost:5000' : PRODUCTION_API;
 
 
 let products = []; // Fetched from Database now for True Sync
