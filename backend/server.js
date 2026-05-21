@@ -7,34 +7,25 @@ const app = express();
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
-// FIX #1: CORS — restrict to known origins instead of wildcard '*'
-// null origin = file:// protocol (opening HTML directly). Needed for local file access.
-const allowedOrigins = [
-    'http://localhost:5500',
-    'http://127.0.0.1:5500',
-    'http://localhost:3000',
-    'http://127.0.0.1:3000',
-    'http://localhost:8080',
-    'http://127.0.0.1:8080',
-    'http://localhost:8000',
-    'http://127.0.0.1:8000',
-    // Netlify deployments
-    /\.netlify\.app$/,
-    // GitHub Pages
-    /\.github\.io$/,
-    // Add your custom production domain here when deploying
-];
+// CORS: allow any localhost port (dev), LAN IPs, Netlify, GitHub Pages, and file:// (null)
 app.use(cors({
     origin: function (origin, callback) {
-        // null origin = file:// protocol (direct file open) — allow it
+        // null origin = file:// protocol — always allow
         if (!origin) return callback(null, true);
-        // Check string matches
-        if (allowedOrigins.some(o =>
-            typeof o === 'string' ? o === origin : o.test(origin)
-        )) return callback(null, true);
+
+        const allowed = (
+            /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin) ||
+            /^https?:\/\/(192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)/.test(origin) ||
+            /\.netlify\.app$/.test(origin) ||
+            /\.github\.io$/.test(origin)
+        );
+
+        if (allowed) return callback(null, true);
+        console.warn(`CORS blocked origin: ${origin}`);
         callback(new Error('Not allowed by CORS'));
     },
     methods: ['GET', 'POST', 'PUT', 'DELETE'],
+    credentials: false
 }));
 
 
