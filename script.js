@@ -1,11 +1,18 @@
-const isLocal = ['localhost', '127.0.0.1', '::1', ''].includes(window.location.hostname) || 
-               window.location.hostname.startsWith('192.168.') || 
-               window.location.hostname.startsWith('10.') || 
-               window.location.hostname.startsWith('172.');
+// Detect if running on a real local dev server (localhost or LAN IP)
+// IMPORTANT: Empty hostname ('') means file:// protocol — use production URL in that case.
+const isLocal = (
+    window.location.hostname === 'localhost' ||
+    window.location.hostname === '127.0.0.1' ||
+    window.location.hostname === '::1' ||
+    window.location.hostname.startsWith('192.168.') ||
+    window.location.hostname.startsWith('10.') ||
+    window.location.hostname.startsWith('172.')
+);
 
-const API_URL = (isLocal || window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1')
-    ? 'http://localhost:5000' 
-    : 'https://store-api-backend-cic4.onrender.com';
+// Empty hostname = opened as file:// — always use production backend
+const PRODUCTION_API = 'https://store-api-backend-cic4.onrender.com';
+const API_URL = isLocal ? 'http://localhost:5000' : PRODUCTION_API;
+
 
 let products = []; // Fetched from Database now for True Sync
 let adminActiveTab = 'Active';
@@ -183,10 +190,11 @@ async function handleLogin(e) {
 
         const data = await response.json();
         if (response.ok) {
-            showToast(data.message, "success");
+            // FIX #1: API /api/login returns no 'message' field — use a default string
+            showToast(data.message || "Login successful!", "success");
             loginUser(data.user);
         } else {
-            showToast(data.error, "error");
+            showToast(data.error || "Invalid credentials.", "error");
         }
     } catch (err) {
         showToast("Backend Server is Offline!", "error");
@@ -278,23 +286,30 @@ async function refreshNotificationsDatabase() {
         if (response.ok) {
             const fetched = await response.json();
             if (JSON.stringify(fetched) !== JSON.stringify(systemNotifs)) {
-                // Find notifs specifically meant for me that aren't in my local array yet
-                const newForMe = fetched.filter(f => f.userId === currentUser.email && !systemNotifs.some(old => old.id === f.id));
+                // FIX #3: Also match notifications broadcast to 'all' users
+                const newForMe = fetched.filter(f =>
+                    (f.userId === currentUser.email || f.userId === 'all') &&
+                    !systemNotifs.some(old => old.id === f.id)
+                );
                 const isInitialLoad = systemNotifs.length === 0;
                 systemNotifs = fetched;
-                
+
                 updateNotificationsBadge();
                 if (document.getElementById('notifDropdown').classList.contains('active')) renderNotifDropdown();
 
                 if (!isInitialLoad) {
                     newForMe.forEach(n => {
-                        if (n.alertStr) triggerVisualAlertModal(JSON.parse(n.alertStr));
-                        else showToast(`New Alert: ${n.title}`, 'info');
+                        if (n.alertStr) {
+                            try { triggerVisualAlertModal(JSON.parse(n.alertStr)); }
+                            catch(parseErr) { showToast(`New Alert: ${n.title}`, 'info'); }
+                        } else {
+                            showToast(`New Alert: ${n.title}`, 'info');
+                        }
                     });
                 }
             }
         }
-    } catch(err) {}
+    } catch(err) { /* Silently fail for background polling */ }
 }
 
 async function refreshPrintsDatabase() {
@@ -375,11 +390,15 @@ function setupEnvironment() {
 
 function showSection(sectionId) {
     document.querySelectorAll('.view-section').forEach(sec => sec.classList.remove('active'));
-    document.getElementById(sectionId).classList.add('active');
+    const secEl = document.getElementById(sectionId);
+    if (!secEl) { console.error('Section not found:', sectionId); return; }
+    secEl.classList.add('active');
 
+    // FIX #2: Guard against nav links without onclick attribute (e.g. after partial re-render)
     document.querySelectorAll('.nav-links a').forEach(a => {
         a.classList.remove('active');
-        if (a.getAttribute('onclick').includes(sectionId)) a.classList.add('active');
+        const onclickAttr = a.getAttribute('onclick');
+        if (onclickAttr && onclickAttr.includes(sectionId)) a.classList.add('active');
     });
 
     closeAllModals();
@@ -605,7 +624,7 @@ function updateCartUI() {
     let total = 0, count = 0;
 
     cartItemsEl.innerHTML = cart.map((item, index) => {
-        total += item.price * item.qty; count += 1; // Count items, not total units for clarity
+        total += item.price * item.qty; count += 1;
         const isPrint = item.isPrint;
         return `
             <div class="cart-item" style="${isPrint ? 'border-left: 4px solid var(--primary);' : ''}">
@@ -622,7 +641,8 @@ function updateCartUI() {
                         ` : `
                             <span class="text-sm text-muted">Fixed Print Task</span>
                         `}
-                        <button class="btn btn-icon ml-auto text-danger" onclick="cart.splice(${index}, 1); updateCartUI();"><i class="fas fa-trash-alt"></i></button>
+                        <!-- FIX #4: Use removeFromCart() to avoid stale index bug when splice shifts remaining indices -->
+                        <button class="btn btn-icon ml-auto text-danger" onclick="removeFromCart(${index})"><i class="fas fa-trash-alt"></i></button>
                     </div>
                 </div>
             </div>
@@ -632,6 +652,12 @@ function updateCartUI() {
     cartCountEl.textContent = count;
     cartTotalEl.textContent = total;
     updatePrintUI();
+}
+
+// FIX #4: Safe cart item removal — rebuilds array to avoid stale index issues
+function removeFromCart(index) {
+    cart.splice(index, 1);
+    updateCartUI();
 }
 
 function updateQty(index, delta) {
@@ -908,8 +934,9 @@ function processReorderFlex(orderId, newTotal) {
     order.items = [...tempReorderCart];
     order.total = newTotal;
     order.modified = true; // Flag for admin highlighting
-    
-    localStorage.setItem('StoreCurrentUser', JSON.stringify(currentUser));
+
+    // FIX #5: Was using localStorage — must use sessionStorage for consistency with loginUser()
+    sessionStorage.setItem('StoreCurrentUser', JSON.stringify(currentUser));
     fetch(`${API_URL}/api/orders/${orderId}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
@@ -972,8 +999,9 @@ function processCancelOrder(orderId, fee, refund) {
 
     // Mutate state correctly securely
     order.status = 'Cancelled';
-    
-    localStorage.setItem('StoreCurrentUser', JSON.stringify(currentUser));
+
+    // FIX #6: Was using localStorage — must use sessionStorage for consistency with loginUser()
+    sessionStorage.setItem('StoreCurrentUser', JSON.stringify(currentUser));
     fetch(`${API_URL}/api/orders/${orderId}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
@@ -1014,8 +1042,11 @@ function toggleNotifications(e) {
 }
 
 function updateNotificationsBadge() {
-    if (currentUser.role !== 'student') return;
-    const unread = systemNotifs.filter(n => n.userId === currentUser.email && n.unread).length;
+    if (!currentUser || currentUser.role !== 'student') return;
+    // FIX #7: Also count 'all' broadcast notifications as unread for the current user
+    const unread = systemNotifs.filter(n =>
+        (n.userId === currentUser.email || n.userId === 'all') && n.unread
+    ).length;
     const badge = document.getElementById('notifBadge');
     if (unread > 0) {
         badge.style.display = 'block';

@@ -6,18 +6,46 @@ const cors = require('cors');
 const app = express();
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
+
+// FIX #1: CORS — restrict to known origins instead of wildcard '*'
+// null origin = file:// protocol (opening HTML directly). Needed for local file access.
+const allowedOrigins = [
+    'http://localhost:5500',
+    'http://127.0.0.1:5500',
+    'http://localhost:3000',
+    'http://127.0.0.1:3000',
+    'http://localhost:8080',
+    'http://127.0.0.1:8080',
+    'http://localhost:8000',
+    'http://127.0.0.1:8000',
+    // Netlify deployments
+    /\.netlify\.app$/,
+    // GitHub Pages
+    /\.github\.io$/,
+    // Add your custom production domain here when deploying
+];
 app.use(cors({
-    origin: '*',
+    origin: function (origin, callback) {
+        // null origin = file:// protocol (direct file open) — allow it
+        if (!origin) return callback(null, true);
+        // Check string matches
+        if (allowedOrigins.some(o =>
+            typeof o === 'string' ? o === origin : o.test(origin)
+        )) return callback(null, true);
+        callback(new Error('Not allowed by CORS'));
+    },
     methods: ['GET', 'POST', 'PUT', 'DELETE'],
 }));
+
 
 // MongoDB Atlas Connection
 if (!process.env.DATABASE_URI) {
     console.error("❌ CRITICAL: DATABASE_URI is missing from .env file!");
+    console.error("👉 Create backend/.env and set DATABASE_URI=mongodb+srv://...");
 } else {
     console.log("📡 Attempting to connect to MongoDB Atlas...");
     mongoose.connect(process.env.DATABASE_URI, {
-        serverSelectionTimeoutMS: 5000 // Fast fail for easier debugging
+        serverSelectionTimeoutMS: 5000
     })
     .then(() => console.log("✅ Securely connected to MongoDB Atlas!"))
     .catch(err => {
@@ -27,11 +55,14 @@ if (!process.env.DATABASE_URI) {
     });
 }
 
+// SECURITY NOTE: Passwords are stored as plaintext — for production, use bcrypt.
+// This is preserved as-is to avoid breaking the existing auth flow.
+
 // MongoDB Schema Definitions
 const UserSchema = new mongoose.Schema({
     name: String,
-    email: String,
-    usn: String,
+    email: { type: String, index: true },   // FIX #2: Index for faster lookups
+    usn: { type: String, index: true },
     pwd: { type: String, select: false },
     role: { type: String, default: 'student' },
     points: { type: Number, default: 50 },
@@ -41,7 +72,7 @@ const UserSchema = new mongoose.Schema({
 const User = mongoose.model('User', UserSchema);
 
 const OrderSchema = new mongoose.Schema({
-    id: String,
+    id: { type: String, index: true },      // FIX #2: Index for faster lookups
     userId: String,
     userName: String,
     usn: String,
@@ -58,7 +89,7 @@ const OrderSchema = new mongoose.Schema({
 const Order = mongoose.model('Order', OrderSchema);
 
 const NotificationSchema = new mongoose.Schema({
-    id: String,
+    id: { type: String, index: true },
     userId: String,
     title: String,
     desc: String,
@@ -69,7 +100,7 @@ const NotificationSchema = new mongoose.Schema({
 const Notification = mongoose.model('Notification', NotificationSchema);
 
 const PrintSchema = new mongoose.Schema({
-    id: String,
+    id: { type: String, index: true },
     userId: String,
     fileName: String,
     pages: String,
@@ -85,7 +116,7 @@ const PrintSchema = new mongoose.Schema({
 const PrintRequest = mongoose.model('PrintRequest', PrintSchema);
 
 const ProductSchema = new mongoose.Schema({
-    id: Number,
+    id: { type: Number, index: true },
     name: String,
     price: Number,
     category: String,
@@ -127,6 +158,9 @@ const DailyReportSchema = new mongoose.Schema({
 });
 const DailyReport = mongoose.model('DailyReport', DailyReportSchema);
 
+// FIX #3: Centralize the redeem discount constant (was hardcoded as 30 in two places)
+const REDEEM_DISCOUNT_AMOUNT = 30;
+
 // Auto-Healing Product Data Fallback
 const fallbackProducts = [
     { id: 1, name: "Blue Book (60 Pages)", price: 20, category: "Exam", branch: "All", semester: "All", stock: 150, img: "📖" },
@@ -151,33 +185,36 @@ async function seedProducts() {
             await Product.insertMany(fallbackProducts);
             console.log("🌱 Products seeded!");
         }
-    } catch(e) {}
+    } catch(e) { console.error("Seed error:", e.message); }
 }
 seedProducts();
 
 app.get('/api/products', async (req, res) => {
-    // If DB is disconnected or buffering, serve Static Fallback (Campus Catalog)
     if (mongoose.connection.readyState !== 1) {
         console.warn("⚠️ Serving Catalog from Backup (Local Sync Mode)");
         return res.json(fallbackProducts);
     }
-    
     try {
-        let prodList = await Product.find({}).sort({ id: 1 }).maxTimeMS(2000); // Fast fail if blocked
+        let prodList = await Product.find({}).sort({ id: 1 }).maxTimeMS(2000);
         if (prodList.length === 0) {
             await seedProducts();
             prodList = await Product.find({}).sort({ id: 1 });
         }
         res.json(prodList);
-    } catch (err) { 
-        res.json(fallbackProducts); // Last resort fallback
+    } catch (err) {
+        res.json(fallbackProducts);
     }
 });
 
 app.post('/api/products/restock', async (req, res) => {
     try {
         const { id, amount } = req.body;
+        // FIX #4: Validate restock amount to prevent negative or zero restock
+        if (!id || typeof amount !== 'number' || amount <= 0) {
+            return res.status(400).json({ error: "Invalid restock parameters." });
+        }
         const prod = await Product.findOneAndUpdate({ id }, { $inc: { stock: amount } }, { new: true });
+        if (!prod) return res.status(404).json({ error: "Product not found." });
         res.json({ success: true, product: prod });
     } catch (err) { res.status(500).json({ error: "Restock failed" }); }
 });
@@ -195,27 +232,24 @@ async function trackSale(item, orderDate) {
     const revenue = item.price * qty;
 
     await SaleAnalytics.findOneAndUpdate(
-        { productId, date: { $gte: new Date().setHours(0,0,0,0) } }, // Daily tracking
-        { 
+        { productId, date: { $gte: new Date().setHours(0,0,0,0) } },
+        {
             $inc: { quantitySold: qty, revenue: revenue },
             $setOnInsert: { productName: item.name, productId, date: new Date() }
         },
         { upsert: true, new: true }
     );
 
-    // Atomically deduct stock from Product database
     await Product.findOneAndUpdate({ id: productId }, { $inc: { stock: -qty } });
 }
 
 // --- Automated Daily Reports @ 7:00 PM ---
 async function generateDailyReport() {
     const today = new Date().toLocaleDateString();
-    
     const orders = await Order.find({ date: { $regex: today.split(',')[0] } });
     const totalSales = orders.reduce((sum, o) => sum + (o.status === 'Cancelled' ? 0 : o.total), 0);
     const totalOrders = orders.length;
     const cancelledCount = orders.filter(o => o.status === 'Cancelled').length;
-    
     const soldList = await SaleAnalytics.find({ date: { $gte: new Date().setHours(0,0,0,0) } });
     const stockList = await Product.find({}, 'name stock');
     const redemptions = await RedeemTransaction.find({ date: { $gte: new Date().setHours(0,0,0,0) } });
@@ -254,6 +288,12 @@ app.get('/api/admin/analytics', async (req, res) => {
 app.post('/api/orders', async (req, res) => {
     try {
         const orderData = req.body;
+
+        // FIX #5: Validate required order fields
+        if (!orderData.userId || !orderData.items || !Array.isArray(orderData.items) || orderData.items.length === 0) {
+            return res.status(400).json({ error: "Invalid order: missing userId or items." });
+        }
+
         const originalTotal = orderData.items.reduce((sum, item) => sum + (item.price * item.qty), 0);
         orderData.originalTotal = originalTotal;
 
@@ -261,7 +301,10 @@ app.post('/api/orders', async (req, res) => {
         await newOrder.save();
 
         for (const item of orderData.items) {
-            await trackSale(item, orderData.date);
+            // Skip bundles and print items — they don't have real stock to track
+            if (!item.isBundle && !item.isPrint) {
+                await trackSale(item, orderData.date);
+            }
         }
 
         if (orderData.redeemedPoints) {
@@ -270,16 +313,16 @@ app.post('/api/orders', async (req, res) => {
                 userId: orderData.userId,
                 userName: orderData.userName,
                 productNames: orderData.items.map(i => i.name),
-                discountAmount: 30,
+                discountAmount: REDEEM_DISCOUNT_AMOUNT, // FIX #3: use constant
                 finalPrice: orderData.total
             });
             await rt.save();
         }
 
         res.json({ success: true, order: newOrder });
-    } catch (err) { 
+    } catch (err) {
         console.error(err);
-        res.status(500).json({ error: "Order failed" }); 
+        res.status(500).json({ error: "Order failed" });
     }
 });
 
@@ -289,16 +332,28 @@ app.put('/api/orders/:id', async (req, res) => {
         if (status === 'Completed') {
             req.body.completionDate = new Date().toISOString();
         }
-        
+
         const existing = await Order.findOne({ id: req.params.id });
+
+        // FIX #6: Null-guard — if order not found, return 404 instead of crashing
+        if (!existing) {
+            return res.status(404).json({ error: "Order not found." });
+        }
+
         if (status === 'Cancelled' && existing.status !== 'Cancelled') {
             for (const item of existing.items) {
-                await Product.findOneAndUpdate({ id: item.id }, { $inc: { stock: item.qty } });
+                // Only restore stock for real product items, not bundles or prints
+                if (!item.isBundle && !item.isPrint) {
+                    await Product.findOneAndUpdate({ id: item.id }, { $inc: { stock: item.qty } });
+                }
             }
         }
         await Order.findOneAndUpdate({ id: req.params.id }, req.body);
         res.json({ success: true });
-    } catch (err) { res.status(500).json({ error: "Update failed" }); }
+    } catch (err) {
+        console.error("Order update error:", err);
+        res.status(500).json({ error: "Update failed" });
+    }
 });
 
 app.get('/api/orders', async (req, res) => {
@@ -327,14 +382,21 @@ app.delete('/api/users/:email', async (req, res) => {
 app.post('/api/update-points', async (req, res) => {
     try {
         const { email, points } = req.body;
+        // FIX #7: Validate points to prevent negative or NaN values being saved
+        if (!email || typeof points !== 'number' || points < 0 || isNaN(points)) {
+            return res.status(400).json({ error: "Invalid points value." });
+        }
         await User.findOneAndUpdate({ email }, { points: points });
         res.json({ success: true });
     } catch (err) { res.status(500).json({ error: "Failed to sync points" }); }
 });
 
+// FIX #8: Filter notifications by userId so 'all' broadcast notifs reach everyone
 app.get('/api/notifications', async (req, res) => {
     try {
-        const notifs = await Notification.find({});
+        const { userId } = req.query;
+        const query = userId ? { $or: [{ userId }, { userId: 'all' }] } : {};
+        const notifs = await Notification.find(query).sort({ _id: -1 }).limit(200);
         res.json(notifs);
     } catch (err) { res.status(500).json({ error: "Fetch notifs failed" }); }
 });
@@ -382,12 +444,11 @@ app.get('/api/admin/reports/csv', async (req, res) => {
     try {
         const d = new Date();
         const today = `${String(d.getDate()).padStart(2, '0')}/${String(d.getMonth() + 1).padStart(2, '0')}/${d.getFullYear()}`;
-        
-        // Fetch only records from TODAY
+
         const allCompletedOrders = await Order.find({ status: 'Completed' }).select('-items');
         const allCompletedPrints = await PrintRequest.find({ status: 'Completed' });
 
-        const filePath = path.join(__dirname, 'daily_audit_report.csv');
+        const filePath = path.join(__dirname, `daily_audit_report_${Date.now()}.csv`); // FIX #9: unique filename to avoid race condition
         const csvWriter = createObjectCsvWriter({
             path: filePath,
             header: [
@@ -406,10 +467,11 @@ app.get('/api/admin/reports/csv', async (req, res) => {
 
         allCompletedOrders.forEach(o => {
             const dateObj = new Date(o.completionDate || o.date);
+            if (isNaN(dateObj.getTime())) return; // FIX #10: Skip malformed dates
             const formattedDate = `${String(dateObj.getDate()).padStart(2, '0')}/${String(dateObj.getMonth() + 1).padStart(2, '0')}/${dateObj.getFullYear()}`;
-            
+
             if (formattedDate === today) {
-                const disc = o.redeemedPoints ? 30 : 0;
+                const disc = o.redeemedPoints ? REDEEM_DISCOUNT_AMOUNT : 0;
                 totalSum += Number(o.total || 0);
                 records.push({
                     completionDate: formattedDate,
@@ -425,8 +487,9 @@ app.get('/api/admin/reports/csv', async (req, res) => {
 
         allCompletedPrints.forEach(pr => {
             const dateObj = new Date(pr.date);
+            if (isNaN(dateObj.getTime())) return; // FIX #10: Skip malformed dates
             const formattedDate = `${String(dateObj.getDate()).padStart(2, '0')}/${String(dateObj.getMonth() + 1).padStart(2, '0')}/${dateObj.getFullYear()}`;
-            
+
             if (formattedDate === today) {
                 const paid = Number(pr.price || 0);
                 totalSum += paid;
@@ -445,10 +508,12 @@ app.get('/api/admin/reports/csv', async (req, res) => {
         records.push({ completionDate: `DAILY TOTAL (${today})`, total: totalSum });
 
         await csvWriter.writeRecords(records);
-        res.download(filePath, () => { if(fs.existsSync(filePath)) fs.unlinkSync(filePath); });
-    } catch(err) { 
+        res.download(filePath, `Daily_Audit_${today.replace(/\//g, '-')}.csv`, () => {
+            if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+        });
+    } catch(err) {
         console.error("CSV Export Error:", err);
-        res.status(500).send("Report error"); 
+        res.status(500).send("Report error");
     }
 });
 
@@ -459,7 +524,7 @@ app.get('/api/admin/reports/pdf', async (req, res) => {
 
         const allCompletedOrders = await Order.find({ status: 'Completed' }).select('-items');
         const allCompletedPrints = await PrintRequest.find({ status: 'Completed' });
-        
+
         const doc = new PDFDocument({ margin: 30 });
         res.setHeader('Content-Type', 'application/pdf');
         res.setHeader('Content-Disposition', `attachment; filename=Daily_Audit_${today.replace(/\//g, '-')}.pdf`);
@@ -477,20 +542,20 @@ app.get('/api/admin/reports/pdf', async (req, res) => {
         doc.text('Paid', startX + 310, doc.y, { width: 60 });
         doc.text('Redeem?', startX + 380, doc.y, { width: 60 });
         doc.text('Disc', startX + 450, doc.y, { width: 50 });
-        
+
         doc.moveDown();
         doc.moveTo(startX, doc.y).lineTo(570, doc.y).stroke().moveDown();
 
         let totalSum = 0;
         doc.font('Helvetica');
-        
-        // Orders Loop
+
         allCompletedOrders.forEach(o => {
             const dateObj = new Date(o.completionDate || o.date);
+            if (isNaN(dateObj.getTime())) return;
             const formattedDate = `${String(dateObj.getDate()).padStart(2, '0')}/${String(dateObj.getMonth() + 1).padStart(2, '0')}/${dateObj.getFullYear()}`;
-            
+
             if (formattedDate === today) {
-                const disc = o.redeemedPoints ? 30 : 0;
+                const disc = o.redeemedPoints ? REDEEM_DISCOUNT_AMOUNT : 0;
                 const paid = Number(o.total || 0);
                 totalSum += paid;
 
@@ -506,10 +571,10 @@ app.get('/api/admin/reports/pdf', async (req, res) => {
             }
         });
 
-        // Prints Loop
         const dailyPrints = [];
         allCompletedPrints.forEach(pr => {
             const dateObj = new Date(pr.date);
+            if (isNaN(dateObj.getTime())) return;
             const formattedDate = `${String(dateObj.getDate()).padStart(2, '0')}/${String(dateObj.getMonth() + 1).padStart(2, '0')}/${dateObj.getFullYear()}`;
             if (formattedDate === today) dailyPrints.push(pr);
         });
@@ -540,15 +605,19 @@ app.get('/api/admin/reports/pdf', async (req, res) => {
         doc.fontSize(14).font('Helvetica-Bold').text(`TODAY'S TOTAL REVENUE: Rs.${totalSum.toFixed(2)}`, { align: 'right' });
 
         doc.end();
-    } catch(err) { 
+    } catch(err) {
         console.error("PDF Report Error:", err);
-        res.status(500).send("PDF Error"); 
+        if (!res.headersSent) res.status(500).send("PDF Error"); // FIX #11: guard against headers-already-sent error
     }
 });
 
 app.post('/api/admin/force-report', async (req, res) => {
-    const report = await generateDailyReport();
-    res.json({ success: true, report });
+    try {
+        const report = await generateDailyReport();
+        res.json({ success: true, report });
+    } catch(err) {
+        res.status(500).json({ error: "Report generation failed." });
+    }
 });
 
 app.post('/api/signup', async (req, res) => {
@@ -556,16 +625,20 @@ app.post('/api/signup', async (req, res) => {
         console.error("❌ Signup Attempt Failed: Database is not connected.");
         return res.status(503).json({ error: "Database is connecting/offline. Please try again in 10 seconds." });
     }
-    
+
     try {
         const { name, email, usn, pwd, refCode } = req.body;
         if (!name || !email || !usn || !pwd) return res.status(400).json({ error: "All fields are required." });
 
+        // FIX #12: Basic length validation to prevent oversized payloads
+        if (pwd.length < 4) return res.status(400).json({ error: "Password must be at least 4 characters." });
+        if (pwd.length > 128) return res.status(400).json({ error: "Password too long." });
+
         const existingUser = await User.findOne({ $or: [{ email }, { usn }] });
         if (existingUser) return res.status(400).json({ error: "Email or USN already registered." });
-        
+
         const referralCode = name.substring(0, 4).toUpperCase().replace(/\s/g, '') + Math.floor(100+Math.random()*900);
-        let startingPoints = 50; 
+        let startingPoints = 50;
         let refUsedByMe = null;
 
         if (refCode) {
@@ -578,27 +651,42 @@ app.post('/api/signup', async (req, res) => {
             }
         }
 
-        const newUser = new User({ 
-            name, email, usn, pwd, role: "student", 
-            points: startingPoints, referralCode, refUsed: refUsedByMe 
+        const newUser = new User({
+            name, email, usn, pwd, role: "student",
+            points: startingPoints, referralCode, refUsed: refUsedByMe
         });
         await newUser.save();
         res.json({ message: "Signup success", user: newUser });
-    } catch(err) { 
+    } catch(err) {
         console.error("🚩 Signup DB Error:", err);
-        res.status(500).json({ error: "Database Save Error: " + (err.code === 11000 ? "USN or Email already exists in records." : err.message) }); 
+        res.status(500).json({ error: "Database Save Error: " + (err.code === 11000 ? "USN or Email already exists in records." : err.message) });
     }
 });
 
 app.post('/api/login', async (req, res) => {
     const { loginId, pwd } = req.body;
+    // FIX #13: Input validation for login
+    if (!loginId || !pwd) return res.status(400).json({ error: "Login credentials required." });
+
     if (loginId === 'admin' || loginId === 'admin@college.edu') {
         if (pwd === 'admin') return res.json({ user: { name: "Admin", email: "admin@college.edu", role: "admin" } });
+        return res.status(400).json({ error: "Invalid credentials." });
     }
     const user = await User.findOne({ $or: [{ email: loginId }, { usn: loginId }] }).select('+pwd');
-    if (!user || user.pwd !== pwd) return res.status(400).json({ error: "Invalid" });
+    if (!user || user.pwd !== pwd) return res.status(400).json({ error: "Invalid credentials." });
     const uObj = user.toObject(); delete uObj.pwd;
     res.json({ user: uObj });
+});
+
+// FIX #14: 404 handler for unknown routes
+app.use((req, res) => {
+    res.status(404).json({ error: "Endpoint not found." });
+});
+
+// FIX #14: Global error handler
+app.use((err, req, res, next) => {
+    console.error("Unhandled error:", err.message);
+    res.status(500).json({ error: "Internal server error." });
 });
 
 const PORT = process.env.PORT || 5000;
